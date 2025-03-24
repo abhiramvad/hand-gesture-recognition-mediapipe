@@ -23,7 +23,7 @@ def get_args():
     parser.add_argument("--height", help='cap height', type=int, default=540)
     parser.add_argument('--use_static_image_mode', action='store_true')
     parser.add_argument("--min_detection_confidence", type=float, default=0.7)
-    parser.add_argument("--min_tracking_confidence", type=int, default=0.5)
+    parser.add_argument("--min_tracking_confidence", type=float, default=0.5)
     args = parser.parse_args()
     return args
 
@@ -45,17 +45,16 @@ class TransformerClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
-        h = self.input_proj(x)  # [batch_size, 21, hidden_dim]
+        h = self.input_proj(x)
         h = F.relu(h)
-        h = self.transformer_encoder(h)  # [batch_size, 21, hidden_dim]
-        h = h.mean(dim=1)  # [batch_size, hidden_dim]
+        h = self.transformer_encoder(h)
+        h = h.mean(dim=1)
         h = F.relu(self.fc1(h))
         h = self.dropout(h)
-        h = self.fc2(h)  # [batch_size, num_classes]
+        h = self.fc2(h)
         return h
 
 def main():
-    # Argument parsing
     args = get_args()
     cap_device = args.device
     cap_width = args.width
@@ -97,29 +96,23 @@ def main():
     # Coordinate history
     history_length = 16
     point_history = deque(maxlen=history_length)
-
-    # Finger gesture history (optional, not used here but kept for compatibility)
     finger_gesture_history = deque(maxlen=history_length)
 
     mode = 0
 
     while True:
         fps = cvFpsCalc.get()
-
-        # Process Key (ESC: end)
         key = cv.waitKey(10)
         if key == 27:  # ESC
             break
         number, mode = select_mode(key, mode)
 
-        # Camera capture
         ret, image = cap.read()
         if not ret:
             break
-        image = cv.flip(image, 1)  # Mirror display
+        image = cv.flip(image, 1)
         debug_image = copy.deepcopy(image)
 
-        # Detection implementation
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
         image.flags.writeable = False
         results = hands.process(image)
@@ -127,28 +120,26 @@ def main():
 
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                # Bounding box calculation
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-                # Conversion to relative coordinates / normalized coordinates
-                pre_processed_landmark_list = pre_process_landmark(landmark_list)
+                # Debug: Check the number of landmarks
+                print(f"Number of landmarks detected: {len(landmark_list)}")
+                if len(landmark_list) != 21:
+                    print("Warning: Incomplete landmark list:", landmark_list)
 
-                # Convert to PyTorch tensor and predict
+                pre_processed_landmark_list = pre_process_landmark(landmark_list)
                 keypoints = np.array(pre_processed_landmark_list, dtype=np.float32).reshape(21, 2)
-                keypoints_tensor = torch.tensor(keypoints, dtype=torch.float32).unsqueeze(0).to(device)  # [1, 21, 2]
+                keypoints_tensor = torch.tensor(keypoints, dtype=torch.float32).unsqueeze(0).to(device)
                 with torch.no_grad():
                     output = model(keypoints_tensor)
                     hand_sign_id = output.argmax(dim=1).item()
 
-                # Point history (for compatibility, not used in Transformer prediction)
-                if hand_sign_id == 2:  # Assuming 2 is a "point" gesture; adjust as needed
+                if hand_sign_id == 2:
                     point_history.append(landmark_list[8])
                 else:
                     point_history.append([0, 0])
 
-                # Drawing part
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
                 debug_image = draw_info_text(
@@ -156,21 +147,18 @@ def main():
                     brect,
                     handedness,
                     keypoint_classifier_labels[hand_sign_id],
-                    ""  # No finger gesture classification here
+                    ""
                 )
         else:
             point_history.append([0, 0])
 
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, fps, mode, number)
-
-        # Screen reflection
         cv.imshow('Hand Gesture Recognition', debug_image)
 
     cap.release()
     cv.destroyAllWindows()
 
-# Helper functions (unchanged from your sample)
 def select_mode(key, mode):
     number = -1
     if 48 <= key <= 57:  # 0 ~ 9
@@ -214,23 +202,137 @@ def pre_process_landmark(landmark_list):
     temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
     max_value = max(list(map(abs, temp_landmark_list)))
     def normalize_(n):
-        return n / max_value if max_value != 0 else n  # Avoid division by zero
+        return n / max_value if max_value != 0 else n
     temp_landmark_list = list(map(normalize_, temp_landmark_list))
     return temp_landmark_list
 
 def draw_landmarks(image, landmark_point):
-    # Same as your original draw_landmarks function
     if len(landmark_point) > 0:
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]), (255, 255, 255), 2)
-        # ... (rest of your draw_landmarks code remains unchanged)
-        for index, landmark in enumerate(landmark_point):
-            if index == 0:
-                cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-                cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-            # ... (rest of keypoint drawing remains unchanged)
+        # Thumb
+        if len(landmark_point) >= 5:  # Ensure enough points for thumb
+            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[4]), tuple(landmark_point[3]), (255, 255, 255), 2)
+
+        # Index finger
+        if len(landmark_point) >= 9:
+            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]), (255, 255, 255), 2)
+
+        # Middle finger
+        if len(landmark_point) >= 13:
+            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]), (255, 255, 255), 2)
+
+        # Ring finger
+        if len(landmark_point) >= 17:
+            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]), (255, 255, 255), 2)
+
+        # Pinky
+        if len(landmark_point) >= 21:
+            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]), (255, 255, 255), 2)
+
+        # Palm
+        if len(landmark_point) >= 18:
+            cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]), (255, 255, 255), 2)
+            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]), (0, 0, 0), 6)
+            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]), (255, 255, 255), 2)
+
+    # Draw keypoints
+    for index, landmark in enumerate(landmark_point):
+        if index == 0:  # Wrist 1
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 1:  # Wrist 2
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 2:  # Thumb: Base
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 3:  # Thumb: Joint 1
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 4:  # Thumb: Tip
+            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
+        if index == 5:  # Index: Base
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 6:  # Index: Joint 2
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 7:  # Index: Joint 1
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 8:  # Index: Tip
+            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
+        if index == 9:  # Middle: Base
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 10:  # Middle: Joint 2
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 11:  # Middle: Joint 1
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 12:  # Middle: Tip
+            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
+        if index == 13:  # Ring: Base
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 14:  # Ring: Joint 2
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 15:  # Ring: Joint 1
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 16:  # Ring: Tip
+            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
+        if index == 17:  # Pinky: Base
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 18:  # Pinky: Joint 2
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 19:  # Pinky: Joint 1
+            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
+        if index == 20:  # Pinky: Tip
+            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
+            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
     return image
 
 def draw_bounding_rect(use_brect, image, brect):

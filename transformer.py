@@ -16,7 +16,7 @@ np.random.seed(RANDOM_SEED)
 
 # Paths
 dataset = 'model/keypoint_classifier/keypoint.csv'
-model_save_path = 'model/keypoint_classifier/keypoint_classifier.pt'
+model_save_path = 'model/keypoint_classifier/transformer.pt'
 output_dir = 'model/keypoint_classifier/plots'
 os.makedirs(output_dir, exist_ok=True)  # Create output directory if it doesn't exist
 
