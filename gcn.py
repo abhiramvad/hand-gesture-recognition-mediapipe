@@ -1,287 +1,194 @@
+import os
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
+from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.data import Data, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Reproducibility
+RANDOM_SEED = 42
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+# Hyperparameters
+BATCH_SIZE = 32
+LR = 1e-3
+MAX_EPOCHS = 100
+PATIENCE = 10
+
+# Define hand graph edges for 21 landmarks
+
+def get_edge_index():
+    edges = [
+        (0,1),(1,2),(2,3),(3,4),        # Thumb
+        (0,5),(5,6),(6,7),(7,8),        # Index
+        (0,9),(9,10),(10,11),(11,12),    # Middle
+        (0,13),(13,14),(14,15),(15,16),  # Ring
+        (0,17),(17,18),(18,19),(19,20),  # Pinky
+        (5,9),(9,13),(13,17)             # Palm
+    ]
+    # Duplicate edges for undirected graph
+    edge_index = torch.tensor(edges + [(j,i) for i,j in edges], dtype=torch.long).t().contiguous()
+    return edge_index
 
 class GCNClassifier(nn.Module):
     def __init__(self, input_dim=2, hidden_dim=64, num_classes=4, dropout=0.3):
-        super(GCNClassifier, self).__init__()
-        self.conv1 = GraphConvLayer(input_dim, hidden_dim)
-        self.conv2 = GraphConvLayer(hidden_dim, hidden_dim)
-        self.fc1 = nn.Linear(hidden_dim * 21, hidden_dim)
+        super().__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, num_classes)
-        self.dropout = nn.Dropout(dropout)
         self.relu = nn.ReLU()
-        
-        # Define adjacency matrix for hand graph (21 landmarks)
-        self.adj = self.create_hand_adjacency_matrix()
-        
-    def create_hand_adjacency_matrix(self):
-        # Adjacency matrix for hand landmarks based on anatomical connections
-        adj = torch.zeros(21, 21)
-        # Connections: wrist to fingers, finger joints
-        connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
-            (0, 5), (5, 6), (6, 7), (7, 8),  # Index
-            (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
-            (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
-            (0, 17), (17, 18 barcos), (18, 19), (19, 20),  # Pinky
-            (5, 9), (9, 13), (13, 17)  # Palm connections
-        ]
-        for i, j in connections:
-            adj[i, j] = 1
-            adj[j, i] = 1
-        # Normalize adjacency matrix
-        degree = torch.sum(adj, dim=1)
-        adj = adj / (degree + 1e-6)  # Add small epsilon to avoid division by zero
-        return adj
-    
-    def forward(self, x):
-        # x: [batch, 21, 2] (landmarks × input_dim)
-        adj = self.adj.to(x.device)
-        x = self.relu(self.conv1(x, adj))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, edge_index, batch):
+        x = self.relu(self.conv1(x, edge_index))
         x = self.dropout(x)
-        x—with torch.no_grad():
-            output = model(keypoints_tensor)
-            hand_sign_id = output.argmax(dim=1).item()
+        x = self.relu(self.conv2(x, edge_index))
+        x = self.dropout(x)
+        x = global_mean_pool(x, batch)
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
-        if hand_sign_id == 2:
-            point_history.append(landmark_list[8])
+
+def load_dataset(csv_path):
+    df = pd.read_csv(csv_path, header=None)
+    labels = df.iloc[:, 0].astype(int).values
+    features = df.iloc[:, 1:].astype(float).values.astype(np.float32)
+    # Map original labels to 0...num_classes-1
+    unique_labels = sorted(np.unique(labels))
+    label_map = {orig: idx for idx, orig in enumerate(unique_labels)}
+    data_list = []
+    edge_index = get_edge_index()
+    for feat, label in zip(features, labels):
+        x = torch.tensor(feat.reshape(21, 2), dtype=torch.float)
+        y = torch.tensor(label_map[label], dtype=torch.long)
+        data = Data(x=x, edge_index=edge_index, y=y)
+        data_list.append(data)
+    return data_list, len(unique_labels)
+
+
+def train_model(data_list, num_classes):
+    labels = [d.y.item() for d in data_list]
+    train_idx, test_idx = train_test_split(
+        list(range(len(data_list))), test_size=0.2,
+        stratify=labels, random_state=RANDOM_SEED
+    )
+    train_idx, val_idx = train_test_split(
+        train_idx, test_size=0.1,
+        stratify=[labels[i] for i in train_idx], random_state=RANDOM_SEED
+    )
+    train_ds = [data_list[i] for i in train_idx]
+    val_ds = [data_list[i] for i in val_idx]
+    test_ds = [data_list[i] for i in test_idx]
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
+
+    model = GCNClassifier(input_dim=2, hidden_dim=64, num_classes=num_classes)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_acc = 0.0
+    patience = 0
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+
+    for epoch in range(1, MAX_EPOCHS + 1):
+        # Training
+        model.train()
+        total_loss, correct, total = 0.0, 0, 0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            out = model(batch.x, batch.edge_index, batch.batch)
+            loss = criterion(out, batch.y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * batch.y.size(0)
+            preds = out.argmax(dim=1)
+            correct += (preds == batch.y).sum().item()
+            total += batch.y.size(0)
+        train_loss = total_loss / total
+        train_acc = correct / total
+
+        # Validation
+        model.eval()
+        val_loss, correct, total = 0.0, 0, 0
+        with torch.no_grad():
+            for batch in val_loader:
+                out = model(batch.x, batch.edge_index, batch.batch)
+                loss = criterion(out, batch.y)
+                val_loss += loss.item() * batch.y.size(0)
+                preds = out.argmax(dim=1)
+                correct += (preds == batch.y).sum().item()
+                total += batch.y.size(0)
+        val_loss /= total
+        val_acc = correct / total
+
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+
+        print(f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+        # Checkpointing
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience = 0
+            torch.save(model.state_dict(), 'model/keypoint_classifier/gcn.pt')
+            print(f"Model saved with Val Acc: {val_acc:.4f}")
         else:
-            point_history.append([0, 0])
+            patience += 1
+            if patience >= PATIENCE:
+                print(f"Early stopping after {epoch} epochs")
+                break
 
-        debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-        debug_image = draw_landmarks(debug_image, landmark_list)
-        debug_image = draw_info_text(
-            debug_image,
-            brect,
-            handedness,
-            keypoint_classifier_labels[hand_sign_id],
-            ""
-        )
-else:
-    point_history.append([0, 0])
+    # Plotting
+    epochs = range(1, len(history['train_loss']) + 1)
+    plt.figure()
+    plt.plot(epochs, history['train_loss'], label='Train Loss')
+    plt.plot(epochs, history['val_loss'], label='Val Loss')
+    plt.legend()
+    os.makedirs('model/keypoint_classifier/plots', exist_ok=True)
+    plt.savefig('model/keypoint_classifier/plots/gcn_loss.png')
 
-debug_image = draw_point_history(debug_image, point_history)
-debug_image = draw_info(debug_image, fps, mode, number)
-cv.imshow('Hand Gesture Recognition', debug_image)
+    plt.figure()
+    plt.plot(epochs, history['train_acc'], label='Train Acc')
+    plt.plot(epochs, history['val_acc'], label='Val Acc')
+    plt.legend()
+    plt.savefig('model/keypoint_classifier/plots/gcn_acc.png')
 
-cap.release()
-cv.destroyAllWindows()
+    # Testing
+    model.load_state_dict(torch.load('model/keypoint_classifier/gcn.pt'))
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            out = model(batch.x, batch.edge_index, batch.batch)
+            preds = out.argmax(dim=1).tolist()
+            labels = batch.y.tolist()
+            all_preds.extend(preds)
+            all_labels.extend(labels)
 
-def select_mode(key, mode):
-    number = -1
-    if 48 <= key <= 57:  # 0 ~ 9
-        number = key - 48
-    if key == 110:  # n
-        mode = 0
-    if key == 107:  # k
-        mode = 1
-    if key == 104:  # h
-        mode = 2
-    return number, mode
+    test_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+    print(f"Final Test Accuracy: {test_acc:.4f}")
+    print(classification_report(all_labels, all_preds))
 
-def calc_bounding_rect(image, landmarks):
-    image_width, image_height = image.shape[1], image.shape[0]
-    landmark_array = np.empty((0, 2), int)
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width), image_width - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        landmark_point = [np.array((landmark_x, landmark_y))]
-        landmark_array = np.append(landmark_array, landmark_point, axis=0)
-    x, y, w, h = cv.boundingRect(landmark_array)
-    return [x, y, x + w, y + h]
-
-def calc_landmark_list(image, landmarks):
-    image_width, image_height = image.shape[1], image.shape[0]
-    landmark_point = []
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width), image_width - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        landmark_point.append([landmark_x, landmark_y])
-    return landmark_point
-
-def pre_process_landmark(landmark_list):
-    temp_landmark_list = copy.deepcopy(landmark_list)
-    base_x, base_y = 0, 0
-    for index, landmark_point in enumerate(temp_landmark_list):
-        if index == 0:
-            base_x, base_y = landmark_point[0], landmark_point[1]
-        temp_landmark_list[index][0] = temp_landmark_list[index][0] - base_x
-        temp_landmark_list[index][1] = temp_landmark_list[index][1] - base_y
-    temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
-    max_value = max(list(map(abs, temp_landmark_list)))
-    def normalize_(n):
-        return n / max_value if max_value != 0 else n
-    temp_landmark_list = list(map(normalize_, temp_landmark_list))
-    return temp_landmark_list
-
-def draw_landmarks(image, landmark_point):
-    if len(landmark_point) > 0:
-        # Thumb
-        if len(landmark_point) >= 5:  # Ensure enough points for thumb
-            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[4]), tuple(landmark_point[3]), (255, 255, 255), 2)
-
-        # Index finger
-        if len(landmark_point) >= 9:
-            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]), (255, 255, 255), 2)
-
-        # Middle finger
-        if len(landmark_point) >= 13:
-            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]), (255, 255, 255), 2)
-
-        # Ring finger
-        if len(landmark_point) >= 17:
-            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]), (255, 255, 255), 2)
-
-        # Pinky
-        if len(landmark_point) >= 21:
-            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]), (255, 255, 255), 2)
-
-        # Palm
-        if len(landmark_point) >= 18:
-            cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]), (255, 255, 255), 2)
-            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]), (0, 0, 0), 6)
-            cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]), (255, 255, 255), 2)
-
-    # Draw keypoints
-    for index, landmark in enumerate(landmark_point):
-        if index == 0:  # Wrist 1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 1:  # Wrist 2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 2:  # Thumb: Base
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 3:  # Thumb: Joint 1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 4:  # Thumb: Tip
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 5:  # Index: Base
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index هتل == 6:  # Index: Joint 2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 7:  # Index: Joint 1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 8:  # Index: Tip
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 9:  # Middle: Base
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 10:  # Middle: Joint 2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 11:  # Middle: Joint 1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 12:  # Middle: Tip
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 13:  # Ring: Base
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 14:  # Ring: Joint 2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 15:  # Ring: Joint 1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 16:  # Ring: Tip
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 17:  # Pinky: Base
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 18:  # Pinky: Joint 2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 19:  # Pinky: Joint 1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 20:  # Pinky: Tip
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255), -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-    return image
-
-def draw_bounding_rect(use_brect, image, brect):
-    if use_brect:
-        cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]), (0, 0, 0), 1)
-    return image
-
-def draw_info_text(image, brect, handedness, hand_sign_text, finger_gesture_text):
-    cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22), (0, 0, 0), -1)
-    info_text = handedness.classification[0].label[0:]
-    if hand_sign_text != "":
-        info_text = info_text + ':' + hand_sign_text
-    cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
-               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-    if finger_gesture_text != "":
-        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
-        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
-    return image
-
-def draw_point_history(image, point_history):
-    for index, point in enumerate(point_history):
-        if point[0] != 0 and point[1] != 0:
-            cv.circle(image, (point[0], point[1]), 1 + int(index / 2), (152, 251, 152), 2)
-    return image
-
-def draw_info(image, fps, mode, number):
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (0, 0, 0), 4, cv.LINE_AA)
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (255, 255, 255), 2, cv.LINE_AA)
-    mode_string = ['Logging Key Point', 'Logging Point History']
-    if 1 <= mode <= 2:
-        cv.putText(image, "MODE:" + mode_string[mode - 1], (10, 90),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-        if 0 <= number <= 9:
-            cv.putText(image, "NUM:" + str(number), (10, 110),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-    return image
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure()
+    sns.heatmap(cm, annot=True, fmt='d')
+    plt.savefig('model/keypoint_classifier/plots/gcn_cm.png')
 
 if __name__ == '__main__':
-    main()
+    data_list, num_classes = load_dataset('gesture_data.csv')
+    print(f"Detected {num_classes} classes")
+    train_model(data_list, num_classes)
