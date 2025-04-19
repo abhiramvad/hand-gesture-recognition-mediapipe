@@ -1,163 +1,72 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-import csv
-import copy
-import argparse
-import itertools
-from collections import Counter
-from collections import deque
-
-import cv2 as cv
-import numpy as np
-import mediapipe as mp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import CvFpsCalc  # Assuming this is in your utils module
-
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--width", help='cap width', type=int, default=960)
-    parser.add_argument("--height", help='cap height', type=int, default=540)
-    parser.add_argument('--use_static_image_mode', action='store_true')
-    parser.add_argument("--min_detection_confidence", type=float, default=0.7)
-    parser.add_argument("--min_tracking_confidence", type=float, default=0.5)
-    args = parser.parse_args()
-    return args
-
-# Transformer Model Definition
-class TransformerClassifier(nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=64, num_classes=4, num_heads=4, num_layers=2, dropout=0.2):
-        super(TransformerClassifier, self).__init__()
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.fc2 = nn.Linear(hidden_dim // 2, num_classes)
+class GCNClassifier(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=64, num_classes=4, dropout=0.3):
+        super(GCNClassifier, self).__init__()
+        self.conv1 = GraphConvLayer(input_dim, hidden_dim)
+        self.conv2 = GraphConvLayer(hidden_dim, hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim * 21, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
         self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
         
+        # Define adjacency matrix for hand graph (21 landmarks)
+        self.adj = self.create_hand_adjacency_matrix()
+        
+    def create_hand_adjacency_matrix(self):
+        # Adjacency matrix for hand landmarks based on anatomical connections
+        adj = torch.zeros(21, 21)
+        # Connections: wrist to fingers, finger joints
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+            (0, 5), (5, 6), (6, 7), (7, 8),  # Index
+            (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
+            (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
+            (0, 17), (17, 18 barcos), (18, 19), (19, 20),  # Pinky
+            (5, 9), (9, 13), (13, 17)  # Palm connections
+        ]
+        for i, j in connections:
+            adj[i, j] = 1
+            adj[j, i] = 1
+        # Normalize adjacency matrix
+        degree = torch.sum(adj, dim=1)
+        adj = adj / (degree + 1e-6)  # Add small epsilon to avoid division by zero
+        return adj
+    
     def forward(self, x):
-        h = self.input_proj(x)
-        h = F.relu(h)
-        h = self.transformer_encoder(h)
-        h = h.mean(dim=1)
-        h = F.relu(self.fc1(h))
-        h = self.dropout(h)
-        h = self.fc2(h)
-        return h
+        # x: [batch, 21, 2] (landmarks × input_dim)
+        adj = self.adj.to(x.device)
+        x = self.relu(self.conv1(x, adj))
+        x = self.dropout(x)
+        x—with torch.no_grad():
+            output = model(keypoints_tensor)
+            hand_sign_id = output.argmax(dim=1).item()
 
-def main():
-    args = get_args()
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
-    use_static_image_mode = args.use_static_image_mode
-    min_detection_confidence = args.min_detection_confidence
-    min_tracking_confidence = args.min_tracking_confidence
-    use_brect = True
-
-    # Camera preparation
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
-
-    # MediaPipe Hands model
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=use_static_image_mode,
-        max_num_hands=1,
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence,
-    )
-
-    # Load PyTorch Transformer model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = TransformerClassifier(input_dim=2, hidden_dim=64, num_classes=4, num_heads=4, num_layers=2)
-    model.load_state_dict(torch.load('model/keypoint_classifier/transformer.pt', map_location=device))
-    model.to(device)
-    model.eval()
-
-    # Read labels
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [row[0] for row in keypoint_classifier_labels]
-
-    # FPS Measurement
-    cvFpsCalc = CvFpsCalc(buffer_len=10)
-
-    # Coordinate history
-    history_length = 16
-    point_history = deque(maxlen=history_length)
-    finger_gesture_history = deque(maxlen=history_length)
-
-    mode = 0
-
-    while True:
-        fps = cvFpsCalc.get()
-        key = cv.waitKey(10)
-        if key == 27:  # ESC
-            break
-        number, mode = select_mode(key, mode)
-
-        ret, image = cap.read()
-        if not ret:
-            break
-        image = cv.flip(image, 1)
-        debug_image = copy.deepcopy(image)
-
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
-        image.flags.writeable = False
-        results = hands.process(image)
-        image.flags.writeable = True
-
-        if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
-                landmark_list = calc_landmark_list(debug_image, hand_landmarks)
-
-                # Debug: Check the number of landmarks
-                print(f"Number of landmarks detected: {len(landmark_list)}")
-                if len(landmark_list) != 21:
-                    print("Warning: Incomplete landmark list:", landmark_list)
-
-                pre_processed_landmark_list = pre_process_landmark(landmark_list)
-                keypoints = np.array(pre_processed_landmark_list, dtype=np.float32).reshape(21, 2)
-                keypoints_tensor = torch.tensor(keypoints, dtype=torch.float32).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    output = model(keypoints_tensor)
-                    hand_sign_id = output.argmax(dim=1).item()
-
-                if hand_sign_id == 2:
-                    point_history.append(landmark_list[8])
-                else:
-                    point_history.append([0, 0])
-
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    ""
-                )
+        if hand_sign_id == 2:
+            point_history.append(landmark_list[8])
         else:
             point_history.append([0, 0])
 
-        debug_image = draw_point_history(debug_image, point_history)
-        debug_image = draw_info(debug_image, fps, mode, number)
-        cv.imshow('Hand Gesture Recognition', debug_image)
+        debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+        debug_image = draw_landmarks(debug_image, landmark_list)
+        debug_image = draw_info_text(
+            debug_image,
+            brect,
+            handedness,
+            keypoint_classifier_labels[hand_sign_id],
+            ""
+        )
+else:
+    point_history.append([0, 0])
 
-    cap.release()
-    cv.destroyAllWindows()
+debug_image = draw_point_history(debug_image, point_history)
+debug_image = draw_info(debug_image, fps, mode, number)
+cv.imshow('Hand Gesture Recognition', debug_image)
+
+cap.release()
+cv.destroyAllWindows()
 
 def select_mode(key, mode):
     number = -1
@@ -288,7 +197,7 @@ def draw_landmarks(image, landmark_point):
         if index == 5:  # Index: Base
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 6:  # Index: Joint 2
+        if index هتل == 6:  # Index: Joint 2
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
         if index == 7:  # Index: Joint 1
