@@ -29,7 +29,7 @@ def get_args():
 
 # Transformer Model Definition
 class TransformerClassifier(nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=64, num_classes=4, num_heads=4, num_layers=2, dropout=0.2):
+    def __init__(self, input_dim=2, hidden_dim=64, num_classes=10, num_heads=4, num_layers=2, dropout=0.2):
         super(TransformerClassifier, self).__init__()
         self.input_proj = nn.Linear(input_dim, hidden_dim)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -80,7 +80,7 @@ def main():
 
     # Load PyTorch Transformer model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = TransformerClassifier(input_dim=2, hidden_dim=64, num_classes=4, num_heads=4, num_layers=2)
+    model = TransformerClassifier(input_dim=2, hidden_dim=64, num_classes=10, num_heads=4, num_layers=2)
     model.load_state_dict(torch.load('model/keypoint_classifier/transformer.pt', map_location=device))
     model.to(device)
     model.eval()
@@ -130,6 +130,13 @@ def main():
 
                 pre_processed_landmark_list = pre_process_landmark(landmark_list)
                 keypoints = np.array(pre_processed_landmark_list, dtype=np.float32).reshape(21, 2)
+                if mode == 1 and number != -1:
+                    row = [number]
+                    row += pre_processed_landmark_list
+                    with open('keypoint.csv', 'a', newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(row)
+
                 keypoints_tensor = torch.tensor(keypoints, dtype=torch.float32).unsqueeze(0).to(device)
                 with torch.no_grad():
                     output = model(keypoints_tensor)
