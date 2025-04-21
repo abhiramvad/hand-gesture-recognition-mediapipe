@@ -13,6 +13,8 @@ import mediapipe as mp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from graph_transformer import GraphTransformerClassifier  # assuming you put it there
+
 
 from utils import CvFpsCalc  # Assuming this is in your utils module
 
@@ -80,8 +82,8 @@ def main():
 
     # Load PyTorch Transformer model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = TransformerClassifier(input_dim=2, hidden_dim=64, num_classes=10, num_heads=4, num_layers=2)
-    model.load_state_dict(torch.load('model/keypoint_classifier/transformer.pt', map_location=device))
+    model = GraphTransformerClassifier(input_dim=2, hidden_dim=64, num_classes=10, num_heads=4, num_layers=2)
+    model.load_state_dict(torch.load('model/keypoint_classifier/graph_transformer.pt', map_location=device))
     model.to(device)
     model.eval()
 
